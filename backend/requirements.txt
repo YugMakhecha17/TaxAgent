@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+langchain-google-genai
+langgraph
+pydantic[email]
+pyjwt
+email-validator
+requests
+
