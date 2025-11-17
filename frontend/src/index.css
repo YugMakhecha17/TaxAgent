@@ -1,43 +1,120 @@
+/* src/index.css or globals.css */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-* {
+/* ============================================= */
+/* 1. Global Reset & Box Sizing */
+/* ============================================= */
+*,
+*::before,
+*::after {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+/* ============================================= */
+/* 2. Root & Body – Luxury Typography & Feel */
+/* ============================================= */
+:root {
+  /* Smooth scrolling for premium feel */
+  scroll-behavior: smooth;
+}
+
+html {
+  font-size: 100%; /* Ensures 1rem = 16px */
+}
+
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #1A1A1A;
-  color: #E0E0E0;
+  text-rendering: optimizeLegibility;
+  background-color: #0f172a; /* Deep navy (slate-900) – matches your login */
+  color: #f8fafc; /* Pure white text */
+  line-height: 1.6;
 }
 
-code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
+/* Optional: Add Inter font via CDN in index.html if not using @import */
+@import url('https://rsms.me/inter/inter.css');
+
+/* ============================================= */
+/* 3. Headings – Playfair Display for Typewriter Luxury */
+/* ============================================= */
+h1, h2, h3, h4, h5, h6,
+.font-montserrat {
+  font-family: 'Montserrat', sans-serif;
 }
 
-/* Custom scrollbar */
+/* ============================================= */
+/* 4. Custom Scrollbar – Subtle & Premium */
+/* ============================================= */
 ::-webkit-scrollbar {
-  width: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #2D2D2D;
+  background: transparent;
+  border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #4A4A4A;
-  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.3); /* slate-400/30 */
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #555555;
+  background: rgba(148, 163, 184, 0.5);
+  background-clip: content-box;
 }
 
+/* Firefox */
+* {
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+
+/* ============================================= */
+/* 5. Code Blocks – Modern Monospace */
+/* ============================================= */
+code, pre, kbd, samp {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Menlo', 'Monaco', Consolas, 'Courier New', monospace;
+  font-variant-ligatures: contextual;
+}
+
+/* Optional: Import JetBrains Mono (beautiful for dashboards) */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ============================================= */
+/* 6. Selection & Focus – Elegant Accent */
+/* ============================================= */
+::selection {
+  background-color: rgba(59, 130, 246, 0.3); /* blue-500/30 */
+  color: white;
+}
+
+:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ============================================= */
+/* 7. Custom Utility Classes (Optional but recommended) */
+/* ============================================= */
+@layer components {
+  .glass {
+    @apply bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl;
+  }
+
+  .btn-primary {
+    @apply bg-slate-900 hover:bg-slate-800 text-white font-semibold py-4 px-8 rounded-2xl transition-all duration-300 transform hover:scale-105 active:scale-98 shadow-xl hover:shadow-2xl;
+  }
+
+  .input-premium {
+    @apply w-full px-6 py-5 bg-white/5 backdrop-blur-xl border border-slate-700 rounded-2xl text-white placeholder-slate-400 text-lg focus:outline-none focus:ring-4 focus:ring-blue-500/20 focus:border-blue-500 transition-all duration-500 shadow-inner hover:shadow-xl;
+  }
+}
