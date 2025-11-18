@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -19,6 +19,9 @@ import jwt
 import hashlib
 import secrets
 import requests
+import PyPDF2
+import io
+from pathlib import Path
 
 load_dotenv()
 
@@ -26,6 +29,12 @@ load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_OAUTH_CALLBACK_URL = os.getenv("GOOGLE_OAUTH_CALLBACK_URL", "http://localhost:3000/auth/callback")
+
+# User can Upload docs (new for Config)
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
 
 # Google endpoints
 GOOGLE_TOKEN_INFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo"
@@ -54,14 +63,12 @@ class GoogleOAuthValidator:
             
             payload = response.json()
             
-            # Verify the token belongs to our application
             if payload.get("aud") != GOOGLE_CLIENT_ID and GOOGLE_CLIENT_ID:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Token audience mismatch"
                 )
             
-            # Check token expiration
             import time
             current_time = int(time.time())
             exp_time = int(payload.get("exp", 0))
@@ -147,7 +154,6 @@ class GoogleOAuthValidator:
             
             token_response = response.json()
             
-            # Verify the ID token
             id_token = token_response.get("id_token")
             if not id_token:
                 raise HTTPException(
@@ -155,7 +161,6 @@ class GoogleOAuthValidator:
                     detail="No ID token in response"
                 )
             
-            # Decode and verify ID token
             user_info = GoogleOAuthValidator.verify_id_token(id_token)
             user_info["access_token"] = token_response.get("access_token")
             user_info["refresh_token"] = token_response.get("refresh_token")
@@ -172,12 +177,13 @@ class GoogleOAuthValidator:
 class GoogleAuthRequest(BaseModel):
     """Request model for Google authentication"""
     token: str
-    token_type: Optional[str] = "id_token"  # 'id_token' or 'access_token'
+    token_type: Optional[str] = "id_token"
 
 
 class GoogleCodeExchangeRequest(BaseModel):
     """Request model for authorization code exchange"""
     code: str
+
 
 # ==================== DATABASE SETUP ====================
 
@@ -199,7 +205,7 @@ def get_db():
 
 
 def init_db():
-    """Initialize database schema"""
+    """Initialize database schema with enhanced features"""
     with get_db() as conn:
         cursor = conn.cursor()
         
@@ -216,40 +222,20 @@ def init_db():
             )
         ''')
         
-        # Check if sessions table exists and if it has user_id column
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-        sessions_table_exists = cursor.fetchone() is not None
-        
-        if sessions_table_exists:
-            # Check if user_id column exists
-            cursor.execute("PRAGMA table_info(sessions)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'user_id' not in columns:
-                # Migrate: Add user_id column to existing sessions table
-                # Note: SQLite doesn't support adding foreign keys via ALTER TABLE,
-                # so we just add the column without the constraint
-                try:
-                    cursor.execute('ALTER TABLE sessions ADD COLUMN user_id TEXT')
-                    conn.commit()
-                except sqlite3.OperationalError as e:
-                    # Column might already exist or other error
-                    print(f"Migration note: {e}")
-        
-        # Sessions table (now linked to users)
+        # Enhanced Sessions table with title
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 user_id TEXT,
+                title TEXT DEFAULT 'New Chat',
                 created_at TEXT NOT NULL,
                 last_query_time TEXT NOT NULL,
-                metadata TEXT
+                metadata TEXT,
+                is_archived INTEGER DEFAULT 0
             )
         ''')
         
-        # Note: Foreign key constraints in SQLite require PRAGMA foreign_keys = ON
-        # We'll handle referential integrity at the application level
-        
-        # Messages table
+        # Enhanced Messages table with embedding support
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 message_id TEXT PRIMARY KEY,
@@ -257,11 +243,43 @@ def init_db():
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
                 FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
             )
         ''')
         
-        # Query history table (for analytics)
+        # Chat Memory table for long-term context
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                memory_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                key_points TEXT,
+                timestamp TEXT NOT NULL,
+                message_range TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # Uploaded Files table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS uploaded_files (
+                file_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                extracted_text TEXT,
+                summary TEXT,
+                upload_timestamp TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # Query history table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS query_history (
                 query_id TEXT PRIMARY KEY,
@@ -276,27 +294,15 @@ def init_db():
             )
         ''')
         
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_messages_session 
-            ON messages(session_id)
-        ''')
-        
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_query_history_session 
-            ON query_history(session_id)
-        ''')
-        
-        # Only create user_id index if the column exists
-        cursor.execute("PRAGMA table_info(sessions)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'user_id' in columns:
-            try:
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_sessions_user 
-                    ON sessions(user_id)
-                ''')
-            except sqlite3.OperationalError:
-                pass  # Index might already exist
+        # Create indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_query_history_session ON query_history(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_last_query ON sessions(last_query_time)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_memory_session ON chat_memory(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_uploaded_files_session ON uploaded_files(session_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_uploaded_files_user ON uploaded_files(user_id)')
 
 
 # ==================== AUTHENTICATION ====================
@@ -351,6 +357,209 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+# ==================== FILE PROCESSING ====================
+
+class FileProcessor:
+    """Handle file upload and text extraction"""
+    
+    @staticmethod
+    def extract_text_from_pdf(file_content: bytes) -> str:
+        """Extract text from PDF file"""
+        try:
+            pdf_file = io.BytesIO(file_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error extracting PDF text: {str(e)}")
+    
+    @staticmethod
+    def extract_text_from_txt(file_content: bytes) -> str:
+        """Extract text from TXT file"""
+        try:
+            return file_content.decode('utf-8')
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error reading text file: {str(e)}")
+    
+    @staticmethod
+    def save_file(user_id: str, session_id: str, file: UploadFile) -> dict:
+        """Save uploaded file and extract text"""
+        file_ext = Path(file.filename).suffix.lower()
+        
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+        
+        file_content = file.file.read()
+        file_size = len(file_content)
+        
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / (1024*1024)}MB"
+            )
+        
+        file_id = str(uuid.uuid4())
+        user_dir = UPLOAD_DIR / user_id / session_id
+        user_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_path = user_dir / f"{file_id}{file_ext}"
+        
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        
+        # Extract text based on file type
+        if file_ext == ".pdf":
+            extracted_text = FileProcessor.extract_text_from_pdf(file_content)
+        elif file_ext == ".txt":
+            extracted_text = FileProcessor.extract_text_from_txt(file_content)
+        else:
+            extracted_text = "Text extraction not supported for this file type"
+        
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "file_path": str(file_path),
+            "file_type": file_ext,
+            "file_size": file_size,
+            "extracted_text": extracted_text
+        }
+
+
+class FileManager:
+    """Manage file database operations"""
+    
+    @staticmethod
+    def save_file_record(user_id: str, session_id: str, file_info: dict, summary: str = None) -> dict:
+        """Save file record to database"""
+        now = datetime.now().isoformat()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO uploaded_files 
+                (file_id, session_id, user_id, filename, file_path, file_type, 
+                 file_size, extracted_text, summary, upload_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                file_info["file_id"],
+                session_id,
+                user_id,
+                file_info["filename"],
+                file_info["file_path"],
+                file_info["file_type"],
+                file_info["file_size"],
+                file_info["extracted_text"],
+                summary,
+                now
+            ))
+        
+        return {
+            "file_id": file_info["file_id"],
+            "filename": file_info["filename"],
+            "upload_timestamp": now
+        }
+    
+    @staticmethod
+    def get_session_files(session_id: str) -> List[dict]:
+        """Get all files uploaded in a session"""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_id, filename, file_type, file_size, summary, upload_timestamp
+                FROM uploaded_files
+                WHERE session_id = ?
+                ORDER BY upload_timestamp DESC
+            ''', (session_id,))
+            files = cursor.fetchall()
+            return [dict(f) for f in files]
+    
+    @staticmethod
+    def get_file_content(file_id: str, user_id: str) -> dict:
+        """Get file content and metadata"""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_id, filename, file_path, extracted_text, summary
+                FROM uploaded_files
+                WHERE file_id = ? AND user_id = ?
+            ''', (file_id, user_id))
+            file = cursor.fetchone()
+            
+            if not file:
+                raise HTTPException(status_code=404, detail="File not found")
+            
+            return dict(file)
+
+
+# ==================== ENHANCED MEMORY SYSTEM ====================
+
+class ChatMemoryManager:
+    """Manage long-term chat memory with summarization"""
+    
+    @staticmethod
+    def create_memory_summary(llm, messages: List[dict]) -> dict:
+        """Create a summary of recent messages"""
+        if len(messages) < 5:
+            return None
+        
+        conversation_text = "\n".join([
+            f"{msg['role']}: {msg['content']}" for msg in messages
+        ])
+        
+        summary_prompt = f"""Summarize the following tax-related conversation into key points and context:
+
+{conversation_text}
+
+Provide:
+1. Main topics discussed
+2. Key decisions or findings
+3. Important context to remember
+
+Keep it concise (max 200 words)."""
+
+        try:
+            response = llm.invoke([HumanMessage(content=summary_prompt)])
+            return {
+                "summary": response.content,
+                "message_count": len(messages)
+            }
+        except Exception as e:
+            print(f"Error creating summary: {e}")
+            return None
+    
+    @staticmethod
+    def save_memory(session_id: str, summary: str, key_points: str, message_range: str):
+        """Save memory summary to database"""
+        memory_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO chat_memory (memory_id, session_id, summary, key_points, timestamp, message_range)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (memory_id, session_id, summary, key_points, now, message_range))
+    
+    @staticmethod
+    def get_session_memory(session_id: str) -> List[dict]:
+        """Get all memory summaries for a session"""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT summary, key_points, timestamp
+                FROM chat_memory
+                WHERE session_id = ?
+                ORDER BY timestamp DESC
+            ''', (session_id,))
+            memories = cursor.fetchall()
+            return [dict(m) for m in memories]
 
 
 class UserManager:
@@ -417,10 +626,19 @@ class UserManager:
 
 
 class SessionManager:
-    """Manage session database operations"""
+    """Manage session database operations with enhanced features"""
     
     @staticmethod
-    def create_session(user_id: Optional[str] = None) -> dict:
+    def generate_session_title(query: str) -> str:
+        """Generate a concise title from the first query"""
+        words = query.split()[:6]
+        title = " ".join(words)
+        if len(query.split()) > 6:
+            title += "..."
+        return title
+    
+    @staticmethod
+    def create_session(user_id: Optional[str] = None, title: str = "New Chat") -> dict:
         """Create new session"""
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
@@ -428,28 +646,42 @@ class SessionManager:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO sessions (session_id, user_id, created_at, last_query_time)
-                VALUES (?, ?, ?, ?)
-            ''', (session_id, user_id, now, now))
+                INSERT INTO sessions (session_id, user_id, title, created_at, last_query_time)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session_id, user_id, title, now, now))
         
         return {
             "session_id": session_id,
             "user_id": user_id,
+            "title": title,
             "created_at": now,
             "last_query_time": now
         }
     
     @staticmethod
-    def get_user_sessions(user_id: str) -> List[dict]:
-        """Get all sessions for a user"""
+    def update_session_title(session_id: str, title: str):
+        """Update session title"""
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT session_id, created_at, last_query_time
+                UPDATE sessions SET title = ? WHERE session_id = ?
+            ''', (title, session_id))
+    
+    @staticmethod
+    def get_user_sessions(user_id: str, include_archived: bool = False) -> List[dict]:
+        """Get all sessions for a user"""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            query = '''
+                SELECT session_id, title, created_at, last_query_time, is_archived
                 FROM sessions
                 WHERE user_id = ?
-                ORDER BY last_query_time DESC
-            ''', (user_id,))
+            '''
+            if not include_archived:
+                query += ' AND is_archived = 0'
+            query += ' ORDER BY last_query_time DESC'
+            
+            cursor.execute(query, (user_id,))
             sessions = cursor.fetchall()
             return [dict(session) for session in sessions]
     
@@ -475,6 +707,7 @@ class SessionManager:
             
             return {
                 "session_id": session["session_id"],
+                "title": session["title"],
                 "created_at": session["created_at"],
                 "last_query_time": session["last_query_time"],
                 "messages": [dict(msg) for msg in messages]
@@ -485,14 +718,15 @@ class SessionManager:
         """Add message to session"""
         message_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
+        token_count = len(content.split())  # Simple token estimation
         
         with get_db() as conn:
             cursor = conn.cursor()
             
             cursor.execute('''
-                INSERT INTO messages (message_id, session_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (message_id, session_id, role, content, now))
+                INSERT INTO messages (message_id, session_id, role, content, timestamp, token_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (message_id, session_id, role, content, now, token_count))
             
             cursor.execute('''
                 UPDATE sessions 
@@ -508,6 +742,44 @@ class SessionManager:
         }
     
     @staticmethod
+    def get_conversation_history(session_id: str, limit: int = 20) -> List[dict]:
+        """Get extended conversation history with memory"""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Get recent messages
+            cursor.execute('''
+                SELECT role, content, timestamp 
+                FROM messages 
+                WHERE session_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (session_id, limit))
+            messages = cursor.fetchall()
+            
+            # Get memory summaries
+            cursor.execute('''
+                SELECT summary, timestamp
+                FROM chat_memory
+                WHERE session_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 3
+            ''', (session_id,))
+            memories = cursor.fetchall()
+            
+            # Combine memory context with recent messages
+            context = []
+            if memories:
+                context.append({
+                    "role": "system",
+                    "content": "Previous conversation context: " + "; ".join([m["summary"] for m in memories]),
+                    "timestamp": memories[0]["timestamp"]
+                })
+            
+            context.extend([dict(msg) for msg in reversed(messages)])
+            return context
+    
+    @staticmethod
     def delete_session(session_id: str) -> bool:
         """Delete session and all associated data"""
         with get_db() as conn:
@@ -521,20 +793,13 @@ class SessionManager:
             return True
     
     @staticmethod
-    def get_conversation_history(session_id: str) -> List[dict]:
-        """Get conversation history for context"""
+    def archive_session(session_id: str):
+        """Archive a session"""
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT role, content, timestamp 
-                FROM messages 
-                WHERE session_id = ? 
-                ORDER BY timestamp DESC 
-                LIMIT 5
+                UPDATE sessions SET is_archived = 1 WHERE session_id = ?
             ''', (session_id,))
-            messages = cursor.fetchall()
-            
-            return [dict(msg) for msg in reversed(messages)]
 
 
 class QueryHistoryManager:
@@ -606,12 +871,12 @@ class QueryHistoryManager:
             }
 
 
-# ==================== FASTAPI SETUP ====================
+# ==================== FASTAPI SETUP (on localhost docs) ====================
 
 app = FastAPI(
     title="Tax Intelligence API",
-    description="Multi-agent Tax Query system with SQLite persistence",
-    version="1.0.0"
+    description="Multi-agent Tax Query system with SQLite persistence and file upload",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -644,6 +909,7 @@ class TaxState(TypedDict):
     needs_follow_up: bool
     last_update_time: str
     final_response: str
+    uploaded_files_context: Optional[str]
 
 
 class QueryRequest(BaseModel):
@@ -670,6 +936,7 @@ class ConversationMessage(BaseModel):
 
 class ConversationSession(BaseModel):
     session_id: str
+    title: str
     messages: List[ConversationMessage]
     created_at: str
     last_query_time: str
@@ -686,19 +953,26 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class GoogleAuthRequest(BaseModel):
-    # Token issued by Google. Can be an OAuth `access_token` or an `id_token` (JWT credential).
-    token: str
-    token_type: Optional[str] = 'access_token'
-
-
 class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: dict
 
 
-# ==================== AGENTS ====================
+class FileUploadResponse(BaseModel):
+    file_id: str
+    filename: str
+    file_size: int
+    extracted_text_preview: str
+    summary: Optional[str]
+    upload_timestamp: str
+
+
+class UpdateTitleRequest(BaseModel):
+    title: str
+
+
+# ==================== Tax Agents ====================
 
 class QueryRouter:
     def __init__(self, llm):
@@ -836,52 +1110,23 @@ Use reverse-chronological order (newest first).
 
 Write in a simple, polite, approachable tone.
 
-Guardrails (Critical)
-
-You must never:
-
-Say you are trained by Google or on Google data.
-
-Disclose training data, model architecture, parameters, or internal system details.
-
-Claim access to private or restricted government systems.
-
-Provide legal interpretations or opinions.
-
-Mention or rely on unofficial / unverified news or social media.
-
-If asked about:
-
-Your training
-
-Who made you
-
-Internal systems
-
-Respond politely:
-“You don’t have access to internal development or training details.”
-
-Special Instruction (Important)
-
-Do NOT ask the user to provide their question.
-If they greet you, simply reply courteously and offer help:
-
-Example style (DON’T output this literally):
-“Hi! Happy to help with GST or tax updates whenever you’re ready.”
-
 User Context
 
 Context: {context}
 User Category: {category}
+Uploaded Files Context: {files_context}
 """
 
     def run(self, state: TaxState) -> TaxState:
         try:
             context = self._build_context(state.get('conversation_history', []))
+            files_context = state.get('uploaded_files_context', 'No files uploaded')
+            
             messages = [
                 SystemMessage(content=self.system_prompt.format(
                     context=context,
-                    category=state.get('user_category', 'general')
+                    category=state.get('user_category', 'general'),
+                    files_context=files_context
                 )),
                 HumanMessage(content=f"Query: {state['query']}\n\nAnswer directly and concisely. Maximum 3-4 paragraphs.")
             ]
@@ -899,8 +1144,11 @@ User Category: {category}
     def _build_context(self, history: list) -> str:
         if not history:
             return "No previous context."
-        recent = history[-3:]
-        return "Recent queries: " + "; ".join([item.get('query', '') for item in recent if item.get('query')])
+        recent = history[-5:]
+        return "Recent conversation: " + "; ".join([
+            f"{item.get('role', 'unknown')}: {item.get('content', '')[:100]}" 
+            for item in recent if item.get('content')
+        ])
 
 
 class StaticLayerAgent:
@@ -965,51 +1213,22 @@ Use bullet points for multiple provisions.
 
 Do not add commentary, opinion, analysis, advice, or assumptions.
 
-Guardrails (Critical)
-
-You must never:
-
-Claim you are trained by Google or on Google data.
-
-Reveal training datasets, architecture, or internal development details.
-
-Offer legal advice, interpretations, or personal views.
-
-Provide unverified, speculative, or unofficial legal information.
-
-Use any non-public government sources.
-
-If asked about:
-
-Your training
-
-Whether you were made by Google
-
-Internal systems
-
-Politely respond:
-“You don’t have access to internal development or training details, and your role is limited to assisting with publicly available statutory text.”
-
-Special Instruction (Important)
-
-Do NOT ask the user to provide their query.
-For greetings, respond with something polite and friendly, like:
-
-(Do not output this literally — this is style guidance)
-“Hello! I’m here if you need any GST or tax legal references.”
-
 User Context
 Context: {context}
 User Category: {category}
+Uploaded Files Context: {files_context}
 """
 
     def run(self, state: TaxState) -> TaxState:
         try:
             context = self._build_context(state.get('conversation_history', []))
+            files_context = state.get('uploaded_files_context', 'No files uploaded')
+            
             messages = [
                 SystemMessage(content=self.system_prompt.format(
                     context=context,
-                    category=state.get('user_category', 'general')
+                    category=state.get('user_category', 'general'),
+                    files_context=files_context
                 )),
                 HumanMessage(content=f"Query: {state['query']}\n\nAnswer directly with specific act sections. Maximum 3-4 paragraphs.")
             ]
@@ -1027,8 +1246,11 @@ User Category: {category}
     def _build_context(self, history: list) -> str:
         if not history:
             return "No previous context."
-        recent = history[-3:]
-        return "Recent queries: " + "; ".join([item.get('query', '') for item in recent if item.get('query')])
+        recent = history[-5:]
+        return "Recent conversation: " + "; ".join([
+            f"{item.get('role', 'unknown')}: {item.get('content', '')[:100]}" 
+            for item in recent if item.get('content')
+        ])
 
 
 class AnalyticalLayerAgent:
@@ -1073,6 +1295,8 @@ Add 2–3 bullet points summarizing compliance or practical impact.
 
 Offer one short step that helps the user continue.
 
+If the user has uploaded tax documents, analyze them in context of their query.
+
 Formatting Rules
 
 Use bold for amounts, sections, and key terms.
@@ -1081,43 +1305,23 @@ Use bullet points for implications or steps.
 
 Keep paragraphs short, clean, and well-structured.
 
-Guardrails (Critical)
-
-You must never:
-
-Say or imply that you were trained by Google or trained on Google data.
-
-Reveal training datasets, model architecture, internal processes, or development details.
-
-Provide legal advice—only factual analysis based on the information given.
-
-Use unofficial, speculative, or unverified information.
-
-Refer to non-public or restricted government sources.
-
-If the user asks about training, origin, or internal workings, respond politely that you don’t have access to internal development or training details, and your role is only to assist with GST and tax-related analysis.
-
-Special Instruction (Important)
-
-Do NOT ask the user to describe their query.
-For greetings, respond politely and lightly, such as:
-
-(Style guidance — do NOT output this literally)
-“Hello! Happy to help whenever you’re ready.”
-
 User Context
 
 Context: {context}
 User Category: {category}
+Uploaded Files Context: {files_context}
 """
 
     def run(self, state: TaxState) -> TaxState:
         try:
             context = self._build_context(state.get('conversation_history', []))
+            files_context = state.get('uploaded_files_context', 'No files uploaded')
+            
             messages = [
                 SystemMessage(content=self.system_prompt.format(
                     context=context,
-                    category=state.get('user_category', 'general')
+                    category=state.get('user_category', 'general'),
+                    files_context=files_context
                 )),
                 HumanMessage(content=f"Query: {state['query']}\n\nAnswer directly and concisely. Maximum 4-5 paragraphs.")
             ]
@@ -1135,8 +1339,11 @@ User Category: {category}
     def _build_context(self, history: list) -> str:
         if not history:
             return "No previous context."
-        recent = history[-3:]
-        return "Recent queries: " + "; ".join([item.get('query', '') for item in recent if item.get('query')])
+        recent = history[-5:]
+        return "Recent conversation: " + "; ".join([
+            f"{item.get('role', 'unknown')}: {item.get('content', '')[:100]}" 
+            for item in recent if item.get('content')
+        ])
 
 
 class TaxKnowledgeAgent:
@@ -1170,6 +1377,8 @@ Key Implications (2–3 bullets) — practical impact or conditions.
 
 Actionable Steps — only if the user needs to file, claim, pay, or comply.
 
+If the user has uploaded tax documents, analyze them thoroughly and provide insights.
+
 Formatting Rules:
 
 Use bold for amounts, rates, sections, and key terms.
@@ -1180,15 +1389,19 @@ Keep language simple, precise, and professional.
 
 Context: {context}
 User Category: {category}
+Uploaded Files Context: {files_context}
 """
 
     def run(self, state: TaxState) -> TaxState:
         try:
             context = self._build_context(state.get('conversation_history', []))
+            files_context = state.get('uploaded_files_context', 'No files uploaded')
+            
             messages = [
                 SystemMessage(content=self.system_prompt.format(
                     context=context,
-                    category=state.get('user_category', 'general')
+                    category=state.get('user_category', 'general'),
+                    files_context=files_context
                 )),
                 HumanMessage(content=f"Query: {state['query']}\n\nAnswer directly and concisely. Maximum 4–5 paragraphs.")
             ]
@@ -1206,8 +1419,11 @@ User Category: {category}
     def _build_context(self, history: list) -> str:
         if not history:
             return "No previous context."
-        recent = history[-3:]
-        return "Recent queries: " + "; ".join([item.get('query', '') for item in recent if item.get('query')])
+        recent = history[-5:]
+        return "Recent conversation: " + "; ".join([
+            f"{item.get('role', 'unknown')}: {item.get('content', '')[:100]}" 
+            for item in recent if item.get('content')
+        ])
 
 
 # ==================== GRAPH BUILDING ====================
@@ -1261,16 +1477,19 @@ def build_gst_graph(llm):
     return workflow.compile()
 
 
-# ==================== API ENDPOINTS ====================
+# ==================== API ENDPOINTS (updated) ====================
 
 @app.get("/")
 async def root():
     return {
-        "message": "Tax Intelligence API",
-        "version": "1.0.0",
+        "message": "Tax Intelligence API v2.0",
+        "version": "2.0.0",
+        "features": ["Multi-agent Tax Assistant", "Long-term Memory", "File Upload", "Chat History"],
         "endpoints": {
+            "auth": "/auth/* (Register, Login, Google OAuth)",
             "query": "/query (POST)",
-            "session": "/session (POST/GET)",
+            "session": "/session/* (POST/GET/DELETE)",
+            "files": "/files/* (POST/GET)",
             "analytics": "/analytics (GET)",
             "health": "/health (GET)"
         }
@@ -1280,58 +1499,6 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-
-@app.post("/query", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
-    if not request.query or len(request.query.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-
-    try:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
-
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.7,
-            api_key=api_key
-        )
-
-        app_graph = build_gst_graph(llm)
-
-        initial_state = {
-            "messages": [],
-            "query": request.query,
-            "user_category": request.user_category or "general",
-            "query_intent": None,
-            "dynamic_updates": None,
-            "static_legal_info": None,
-            "ai_derived_analysis": None,
-            "conversation_history": [],
-            "relevant_context": None,
-            "target_agent": None,
-            "needs_follow_up": False,
-            "last_update_time": datetime.now().isoformat(),
-            "final_response": ""
-        }
-
-        result = app_graph.invoke(initial_state)
-
-        return QueryResponse(
-            id=str(uuid.uuid4()),
-            query=request.query,
-            user_category=result.get('user_category', 'unknown'),
-            query_intent=result.get('query_intent', 'unknown'),
-            target_agent=result.get('target_agent', 'unknown'),
-            final_response=result.get('final_response', ''),
-            timestamp=datetime.now().isoformat()
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
@@ -1389,22 +1556,11 @@ async def login(request: LoginRequest):
 
 @app.post("/auth/google", response_model=AuthResponse)
 async def google_auth(request: GoogleAuthRequest):
-    '''
-    Authenticate with Google token.
-    
-    Accepts:
-    - id_token: JWT token from client-side Google Sign-In
-    - access_token: OAuth access token
-    
-    Returns:
-    - JWT access token for your application
-    - User information
-    '''
+    """Authenticate with Google token"""
     try:
         token = request.token.strip()
         token_type = (request.token_type or 'id_token').lower()
         
-        # Validate and get user info from Google
         if token_type == 'id_token':
             user_info = GoogleOAuthValidator.verify_id_token(token)
         elif token_type == 'access_token':
@@ -1425,15 +1581,12 @@ async def google_auth(request: GoogleAuthRequest):
                 detail="Unable to extract user info from token"
             )
         
-        # Link or create local user
         existing_user = UserManager.get_user_by_google_id(google_id)
         
         if not existing_user:
-            # Check if email already exists (link accounts)
             email_user = UserManager.get_user_by_email(email)
             
             if email_user:
-                # Link Google ID to existing account
                 with get_db() as conn:
                     cursor = conn.cursor()
                     cursor.execute(
@@ -1442,7 +1595,6 @@ async def google_auth(request: GoogleAuthRequest):
                     )
                 user = UserManager.get_user_by_id(email_user['user_id'])
             else:
-                # Create new user
                 user = UserManager.create_user(
                     email=email,
                     name=name,
@@ -1451,7 +1603,6 @@ async def google_auth(request: GoogleAuthRequest):
         else:
             user = existing_user
         
-        # Create JWT access token
         access_token = create_access_token(data={'sub': user['user_id']})
         UserManager.update_last_login(user['user_id'])
         
@@ -1472,15 +1623,10 @@ async def google_auth(request: GoogleAuthRequest):
             detail=f'Google authentication error: {str(e)}'
         )
 
- # =================== GOOGLE OAUTH ENDPOINT ====================
+
 @app.post("/auth/google/callback", response_model=AuthResponse)
 async def google_callback(request: GoogleCodeExchangeRequest):
-    '''
-    Handle Google OAuth authorization code exchange (server-side flow).
-    
-    This endpoint receives the authorization code from the frontend
-    and exchanges it for tokens securely on the server.
-    '''
+    """Handle Google OAuth authorization code exchange"""
     try:
         user_info = GoogleOAuthValidator.exchange_code_for_token(request.code)
         
@@ -1494,7 +1640,6 @@ async def google_callback(request: GoogleCodeExchangeRequest):
                 detail="Unable to extract user info from token"
             )
         
-        # Link or create local user
         existing_user = UserManager.get_user_by_google_id(google_id)
         
         if not existing_user:
@@ -1551,9 +1696,11 @@ async def get_current_user(user_id: str = Depends(verify_token)):
 
 @app.post("/session")
 async def create_session(user_id: str = Depends(verify_token)) -> ConversationSession:
+    """Create a new chat session"""
     session = SessionManager.create_session(user_id)
     return ConversationSession(
         session_id=session["session_id"],
+        title=session["title"],
         messages=[],
         created_at=session["created_at"],
         last_query_time=session["last_query_time"]
@@ -1562,36 +1709,59 @@ async def create_session(user_id: str = Depends(verify_token)) -> ConversationSe
 
 @app.get("/sessions")
 async def get_user_sessions(user_id: str = Depends(verify_token)):
-    """Get all sessions for current user"""
+    """Get all chat sessions for current user"""
     sessions = SessionManager.get_user_sessions(user_id)
-    return {"sessions": sessions}
+    return {"sessions": sessions, "total": len(sessions)}
 
 
 @app.get("/session/{session_id}", response_model=ConversationSession)
 async def get_session(session_id: str, user_id: str = Depends(verify_token)):
+    """Get a specific chat session with all messages"""
     session = SessionManager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Verify session belongs to user
     if session.get("user_id") and session["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
     
     return ConversationSession(
         session_id=session["session_id"],
+        title=session["title"],
         messages=[ConversationMessage(**msg) for msg in session["messages"]],
         created_at=session["created_at"],
         last_query_time=session["last_query_time"]
     )
 
 
-@app.post("/session/{session_id}/query", response_model=QueryResponse)
-async def process_query_with_session(session_id: str, request: QueryRequest, user_id: str = Depends(verify_token)):
+@app.patch("/session/{session_id}/title")
+async def update_session_title(
+    session_id: str, 
+    request: UpdateTitleRequest,
+    user_id: str = Depends(verify_token)
+):
+    """Update chat session title"""
     session = SessionManager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Verify session belongs to user
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    SessionManager.update_session_title(session_id, request.title)
+    return {"message": "Title updated successfully", "title": request.title}
+
+
+@app.post("/session/{session_id}/query", response_model=QueryResponse)
+async def process_query_with_session(
+    session_id: str, 
+    request: QueryRequest, 
+    user_id: str = Depends(verify_token)
+):
+    """Process a query within a chat session with extended memory"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
     if session.get("user_id") and session["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -1606,9 +1776,19 @@ async def process_query_with_session(session_id: str, request: QueryRequest, use
             api_key=api_key
         )
 
-        app_graph = build_gst_graph(llm)
+        # Get extended conversation history (last 20 messages + memory summaries)
+        history = SessionManager.get_conversation_history(session_id, limit=20)
         
-        history = SessionManager.get_conversation_history(session_id)
+        # Get uploaded files context
+        session_files = FileManager.get_session_files(session_id)
+        files_context = "No files uploaded"
+        if session_files:
+            files_context = "Uploaded files:\n" + "\n".join([
+                f"- {f['filename']}: {f.get('summary', 'No summary')[:200]}"
+                for f in session_files[:3]  # Include context from last 3 files
+            ])
+
+        app_graph = build_gst_graph(llm)
 
         initial_state = {
             "messages": [],
@@ -1623,14 +1803,17 @@ async def process_query_with_session(session_id: str, request: QueryRequest, use
             "target_agent": None,
             "needs_follow_up": False,
             "last_update_time": datetime.now().isoformat(),
-            "final_response": ""
+            "final_response": "",
+            "uploaded_files_context": files_context
         }
 
         result = app_graph.invoke(initial_state)
 
+        # Save messages
         SessionManager.add_message(session_id, "user", request.query)
         SessionManager.add_message(session_id, "assistant", result.get('final_response', ''))
         
+        # Log query
         QueryHistoryManager.log_query(
             session_id,
             request.query,
@@ -1639,6 +1822,23 @@ async def process_query_with_session(session_id: str, request: QueryRequest, use
             result.get('target_agent', 'unknown'),
             result.get('final_response', '')
         )
+        
+        # Update session title if this is the first query
+        if len(session["messages"]) == 0:
+            title = SessionManager.generate_session_title(request.query)
+            SessionManager.update_session_title(session_id, title)
+        
+        # Create memory summary every 10 messages
+        message_count = len(SessionManager.get_session(session_id)["messages"])
+        if message_count % 10 == 0 and message_count > 0:
+            summary_result = ChatMemoryManager.create_memory_summary(llm, history[-10:])
+            if summary_result:
+                ChatMemoryManager.save_memory(
+                    session_id,
+                    summary_result["summary"],
+                    "",
+                    f"Messages {message_count-10} to {message_count}"
+                )
 
         return QueryResponse(
             id=str(uuid.uuid4()),
@@ -1657,27 +1857,282 @@ async def process_query_with_session(session_id: str, request: QueryRequest, use
 
 
 @app.delete("/session/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, user_id: str = Depends(verify_token)):
+    """Delete a chat session"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
     success = SessionManager.delete_session(session_id)
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Session deleted successfully"}
 
 
+@app.post("/session/{session_id}/archive")
+async def archive_session(session_id: str, user_id: str = Depends(verify_token)):
+    """Archive a chat session"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    SessionManager.archive_session(session_id)
+    return {"message": "Session archived successfully"}
+
+
+# ==================== FILE UPLOAD ENDPOINTS ====================
+
+@app.post("/session/{session_id}/upload", response_model=FileUploadResponse)
+async def upload_file(
+    session_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(verify_token)
+):
+    """Upload a tax document to a session"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        # Save file and extract text
+        file_info = FileProcessor.save_file(user_id, session_id, file)
+        
+        # Generate summary using LLM
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key and file_info["extracted_text"]:
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash-lite",
+                temperature=0.3,
+                api_key=api_key
+            )
+            
+            summary_prompt = f"""Analyze this tax document and provide a concise summary (max 150 words):
+
+{file_info["extracted_text"][:3000]}
+
+Focus on:
+1. Document type and purpose
+2. Key tax information (amounts, dates, sections)
+3. Main implications or requirements
+
+Be specific and factual."""
+
+            try:
+                response = llm.invoke([HumanMessage(content=summary_prompt)])
+                summary = response.content
+            except Exception as e:
+                print(f"Summary generation error: {e}")
+                summary = "Summary generation failed"
+        else:
+            summary = "No summary available"
+        
+        # Save file record to database
+        file_record = FileManager.save_file_record(user_id, session_id, file_info, summary)
+        
+        # Preview of extracted text
+        preview = file_info["extracted_text"][:500] + "..." if len(file_info["extracted_text"]) > 500 else file_info["extracted_text"]
+        
+        return FileUploadResponse(
+            file_id=file_record["file_id"],
+            filename=file_record["filename"],
+            file_size=file_info["file_size"],
+            extracted_text_preview=preview,
+            summary=summary,
+            upload_timestamp=file_record["upload_timestamp"]
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+
+@app.get("/session/{session_id}/files")
+async def get_session_files(session_id: str, user_id: str = Depends(verify_token)):
+    """Get all files uploaded in a session"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    files = FileManager.get_session_files(session_id)
+    return {"session_id": session_id, "files": files, "total": len(files)}
+
+
+@app.get("/files/{file_id}")
+async def get_file_details(file_id: str, user_id: str = Depends(verify_token)):
+    """Get detailed information about an uploaded file"""
+    file_info = FileManager.get_file_content(file_id, user_id)
+    return file_info
+
+
+@app.get("/files/{file_id}/analyze")
+async def analyze_uploaded_file(
+    file_id: str,
+    query: Optional[str] = None,
+    user_id: str = Depends(verify_token)
+):
+    """Analyze an uploaded file with optional specific query"""
+    file_info = FileManager.get_file_content(file_id, user_id)
+    
+    if not file_info.get("extracted_text"):
+        raise HTTPException(status_code=400, detail="No text content available for analysis")
+    
+    try:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+        
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.5,
+            api_key=api_key
+        )
+        
+        if query:
+            analysis_prompt = f"""You are a tax expert. Analyze this document and answer the user's question:
+
+Document content:
+{file_info['extracted_text'][:4000]}
+
+User's question: {query}
+
+Provide a clear, detailed answer based on the document content."""
+        else:
+            analysis_prompt = f"""You are a tax expert. Analyze this tax document comprehensively:
+
+Document content:
+{file_info['extracted_text'][:4000]}
+
+Provide:
+1. Document type and purpose
+2. Key tax figures and dates
+3. Compliance requirements or implications
+4. Potential issues or areas needing attention
+5. Recommended next steps
+
+Be thorough but concise."""
+        
+        response = llm.invoke([HumanMessage(content=analysis_prompt)])
+        
+        return {
+            "file_id": file_id,
+            "filename": file_info["filename"],
+            "query": query or "General analysis",
+            "analysis": response.content,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+# ==================== *Endpoints for memory*
+async def get_session_memory(session_id: str, user_id: str = Depends(verify_token)):
+    """Get memory summaries for a session"""
+    session = SessionManager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    memories = ChatMemoryManager.get_session_memory(session_id)
+    return {
+        "session_id": session_id,
+        "memories": memories,
+        "total": len(memories)
+    }
+
+
+# ==================== new endpoints for analytics ====================
+
 @app.get("/analytics")
-async def get_analytics():
+async def get_analytics(user_id: str = Depends(verify_token)):
+    """Get system-wide analytics"""
     analytics = QueryHistoryManager.get_analytics()
     return analytics
 
 
 @app.get("/session/{session_id}/queries")
-async def get_session_queries(session_id: str):
+async def get_session_queries(session_id: str, user_id: str = Depends(verify_token)):
+    """Get query history for a session"""
     session = SessionManager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    if session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
     queries = QueryHistoryManager.get_session_queries(session_id)
     return {"session_id": session_id, "queries": queries}
+
+
+# ==================== this will be the Legacy ENDPOINT (for backward compatibility) ====================
+
+@app.post("/query", response_model=QueryResponse)
+async def process_query(request: QueryRequest):
+    """Process query without session (legacy endpoint)"""
+    if not request.query or len(request.query.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    try:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.7,
+            api_key=api_key
+        )
+
+        app_graph = build_gst_graph(llm)
+
+        initial_state = {
+            "messages": [],
+            "query": request.query,
+            "user_category": request.user_category or "general",
+            "query_intent": None,
+            "dynamic_updates": None,
+            "static_legal_info": None,
+            "ai_derived_analysis": None,
+            "conversation_history": [],
+            "relevant_context": None,
+            "target_agent": None,
+            "needs_follow_up": False,
+            "last_update_time": datetime.now().isoformat(),
+            "final_response": "",
+            "uploaded_files_context": "No files uploaded"
+        }
+
+        result = app_graph.invoke(initial_state)
+
+        return QueryResponse(
+            id=str(uuid.uuid4()),
+            query=request.query,
+            user_category=result.get('user_category', 'unknown'),
+            query_intent=result.get('query_intent', 'unknown'),
+            target_agent=result.get('target_agent', 'unknown'),
+            final_response=result.get('final_response', ''),
+            timestamp=datetime.now().isoformat()
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
 if __name__ == "__main__":

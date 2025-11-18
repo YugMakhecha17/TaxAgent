@@ -1,18 +1,19 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
-const api = axios.create({
+// Create axios instance with default config
+const apiClient = axios.create({
   baseURL: API_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
-// Add token to requests
-api.interceptors.request.use(
+// Add token to requests if available
+apiClient.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('access_token');
+    const token = localStorage.getItem('token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -24,36 +25,81 @@ api.interceptors.request.use(
 );
 
 // Handle token expiration
-api.interceptors.response.use(
+apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('user');
+      localStorage.removeItem('token');
       window.location.href = '/login';
     }
     return Promise.reject(error);
   }
 );
 
+// Authentication API
 export const authAPI = {
-  register: (data) => api.post('/auth/register', data),
-  login: (data) => api.post('/auth/login', data),
-  googleAuth: (data) => api.post('/auth/google', data),
-  getMe: () => api.get('/auth/me'),
+  register: (data) => apiClient.post('/auth/register', data),
+  login: (data) => apiClient.post('/auth/login', data),
+  googleAuth: (token, tokenType = 'id_token') => 
+    apiClient.post('/auth/google', { token, token_type: tokenType }),
+  googleCallback: (code) => 
+    apiClient.post('/auth/google/callback', { code }),
+  getCurrentUser: () => apiClient.get('/auth/me'),
 };
 
+// Session API
 export const sessionAPI = {
-  createSession: () => api.post('/session'),
-  getSession: (sessionId) => api.get(`/session/${sessionId}`),
-  getUserSessions: () => api.get('/sessions'),
-  deleteSession: (sessionId) => api.delete(`/session/${sessionId}`),
+  createSession: () => apiClient.post('/session'),
+  getSessions: () => apiClient.get('/sessions'),
+  getSession: (sessionId) => apiClient.get(`/session/${sessionId}`),
+  deleteSession: (sessionId) => apiClient.delete(`/session/${sessionId}`),
+  archiveSession: (sessionId) => apiClient.post(`/session/${sessionId}/archive`),
+  updateSessionTitle: (sessionId, title) => 
+    apiClient.patch(`/session/${sessionId}/title`, { title }),
+  getSessionMemory: (sessionId) => apiClient.get(`/session/${sessionId}/memory`),
+  getSessionQueries: (sessionId) => apiClient.get(`/session/${sessionId}/queries`),
 };
 
+// Query API
 export const queryAPI = {
-  processQuery: (sessionId, query, userCategory) =>
-    api.post(`/session/${sessionId}/query`, { query, user_category: userCategory }),
+  processQuery: (sessionId, query, userCategory = null) =>
+    apiClient.post(`/session/${sessionId}/query`, { 
+      query, 
+      user_category: userCategory 
+    }),
+  // Legacy endpoint without session
+  processQueryLegacy: (query, userCategory = null) =>
+    apiClient.post('/query', { 
+      query, 
+      user_category: userCategory 
+    }),
 };
 
-export default api;
+// File API
+export const fileAPI = {
+  uploadFile: (sessionId, formData) => {
+    return apiClient.post(`/session/${sessionId}/upload`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+  },
+  getSessionFiles: (sessionId) => apiClient.get(`/session/${sessionId}/files`),
+  getFileDetails: (fileId) => apiClient.get(`/files/${fileId}`),
+  analyzeFile: (fileId, query = null) => {
+    const params = query ? { query } : {};
+    return apiClient.get(`/files/${fileId}/analyze`, { params });
+  },
+};
 
+// Analytics API
+export const analyticsAPI = {
+  getAnalytics: () => apiClient.get('/analytics'),
+};
+
+// Health check
+export const healthAPI = {
+  check: () => apiClient.get('/health'),
+};
+
+export default apiClient;
